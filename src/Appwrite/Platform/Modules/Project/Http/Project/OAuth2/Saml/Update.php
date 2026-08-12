@@ -2,6 +2,7 @@
 
 namespace Appwrite\Platform\Modules\Project\Http\Project\OAuth2\Saml;
 
+use Appwrite\Auth\OAuth2\Saml as SamlAdapter;
 use Appwrite\Auth\SAML\Settings;
 use Appwrite\Event\Event as QueueEvent;
 use Appwrite\Extend\Exception;
@@ -42,7 +43,7 @@ class Update extends Base
 
     public static function getProviderClass(): string
     {
-        return Settings::class;
+        return SamlAdapter::class;
     }
 
     public static function getProviderLabel(): string

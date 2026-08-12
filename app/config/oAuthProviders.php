@@ -358,7 +358,7 @@ return [
         'beta' => true,
         'mock' => false,
         'protocol' => 'saml',
-        'class' => 'Appwrite\\Auth\\SAML\\Settings',
+        'class' => 'Appwrite\\Auth\\OAuth2\\Saml',
     ],
     'slack' => [
         'name' => 'Slack',
