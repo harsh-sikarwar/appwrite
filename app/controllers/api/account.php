@@ -1,6 +1,8 @@
 <?php
 
 use Ahc\Jwt\JWT;
+use Appwrite\Auth\LDAP\Client as LDAPClient;
+use Appwrite\Auth\LDAP\Settings as LDAPSettings;
 use Appwrite\Auth\MFA\Type;
 use Appwrite\Auth\OAuth2\Exception as OAuth2Exception;
 use Appwrite\Auth\Phrase;
@@ -1043,6 +1045,213 @@ Http::post('/v1/account/sessions/email')
                 'hashOptions' => $user->getAttribute('hashOptions'),
             ]));
         }
+
+        $session = $dbForProject->createDocument('sessions', $session->setAttribute('$permissions', [
+            Permission::read(Role::user($user->getId())),
+            Permission::update(Role::user($user->getId())),
+            Permission::delete(Role::user($user->getId())),
+        ]));
+
+        $dbForProject->purgeCachedDocument('users', $user->getId());
+
+        $encoded = $store
+            ->setProperty('id', $user->getId())
+            ->setProperty('secret', $secret)
+            ->encode();
+
+        if (!$domainVerification) {
+            $response->addHeader('X-Fallback-Cookies', \json_encode([$store->getKey() => $encoded]));
+        }
+
+        $expire = DateTime::formatTz(DateTime::addSeconds(new \DateTime(), $duration));
+
+        $response
+            ->addCookie($store->getKey() . '_legacy', $encoded, (new \DateTime($expire))->getTimestamp(), '/', $cookieDomain, ('https' == $protocol), true, null)
+            ->addCookie($store->getKey(), $encoded, (new \DateTime($expire))->getTimestamp(), '/', $cookieDomain, ('https' == $protocol), true, Config::getParam('cookieSamesite'))
+            ->setStatusCode(Response::STATUS_CODE_CREATED)
+        ;
+
+        $countryName = $locale->getText('countries.' . strtolower($session->getAttribute('countryCode')), $locale->getText('locale.country.unknown'));
+
+        $session
+            ->setAttribute('current', true)
+            ->setAttribute('countryName', $countryName)
+            ->setAttribute('secret', $encoded)
+        ;
+
+        $queueForEvents
+            ->setParam('userId', $user->getId())
+            ->setParam('sessionId', $session->getId())
+        ;
+
+        $bus->dispatch(new SessionCreated(
+            user: $user->getArrayCopy(),
+            project: $project->getArrayCopy(),
+            session: $session->getArrayCopy(),
+            locale: $locale->default,
+        ));
+
+        $response->dynamic($session, Response::MODEL_SESSION);
+    });
+
+Http::post('/v1/account/sessions/ldap')
+    ->desc('Create LDAP session')
+    ->groups(['api', 'account', 'auth', 'session'])
+    ->label('event', 'users.[userId].sessions.[sessionId].create')
+    ->label('scope', 'sessions.write')
+    ->label('auth.type', 'ldap')
+    ->label('audits.event', 'session.create')
+    ->label('audits.resource', 'user/{response.userId}')
+    ->label('audits.userId', '{response.userId}')
+    ->label('sdk', new Method(
+        namespace: 'account',
+        group: 'sessions',
+        name: 'createLdapSession',
+        description: <<<EOT
+        Authenticate against the project's configured LDAP directory and create a session.
+
+        The credentials are verified by binding to the directory and are never stored by Appwrite. When the directory accepts them and no matching account exists yet, one is created from the directory entry.
+        EOT,
+        auth: [AuthType::ADMIN, AuthType::SESSION, AuthType::JWT],
+        responses: [
+            new SDKResponse(
+                code: Response::STATUS_CODE_CREATED,
+                model: Response::MODEL_SESSION,
+            )
+        ],
+        contentType: ContentType::JSON
+    ))
+    ->label('abuse-limit', 10)
+    ->label('abuse-key', 'url:{url},username:{param-username}')
+    ->label('abuse-reset', [201])
+    ->param('username', '', new Text(256), 'Username as the directory knows it. Substituted into the configured user filter.')
+    ->param('password', '', new Text(256, 0), 'User password held by the directory.')
+    ->inject('request')
+    ->inject('response')
+    ->inject('user')
+    ->inject('dbForProject')
+    ->inject('project')
+    ->inject('locale')
+    ->inject('geoRecord')
+    ->inject('queueForEvents')
+    ->inject('bus')
+    ->inject('store')
+    ->inject('proofForPassword')
+    ->inject('proofForToken')
+    ->inject('domainVerification')
+    ->inject('cookieDomain')
+    ->inject('authorization')
+    ->action(function (string $username, string $password, Request $request, Response $response, User $user, Database $dbForProject, Document $project, Locale $locale, GeoRecord $geoRecord, Event $queueForEvents, Bus $bus, Store $store, ProofsPassword $proofForPassword, ProofsToken $proofForToken, bool $domainVerification, ?string $cookieDomain, Authorization $authorization) {
+        $protocol = $request->getProtocol();
+
+        // Whether LDAP is enabled for the project is checked by the shared
+        // auth.type gate in app/controllers/shared/api/auth.php.
+        $auths = $project->getAttribute('auths', []);
+
+        $settings = LDAPSettings::fromProject($project);
+        $identity = (new LDAPClient($settings))->authenticate($username, $password);
+
+        // A wrong password, an unknown user, and a user outside the provisioning
+        // filter are deliberately indistinguishable: telling them apart lets a
+        // directory be probed for valid usernames.
+        if ($identity === null) {
+            throw new Exception(Exception::USER_INVALID_CREDENTIALS);
+        }
+
+        $email = $identity->getEmail();
+
+        $profile = $dbForProject->findOne('users', [
+            Query::equal('email', [$email]),
+        ]);
+
+        if ($profile->isEmpty()) {
+            $limit = $auths['limit'] ?? 0;
+
+            if ($limit !== 0) {
+                $total = $dbForProject->count('users', max: APP_LIMIT_USERS);
+
+                if ($total >= $limit) {
+                    throw new Exception(Exception::USER_COUNT_EXCEEDED);
+                }
+            }
+
+            // The directory just vouched for this person, so provision them.
+            // Which directory entries are eligible is governed by the
+            // provisioning filter, evaluated during the bind above.
+            $userId = ID::unique();
+            $profile = $authorization->skip(fn () => $dbForProject->createDocument('users', new Document([
+                '$id' => $userId,
+                '$permissions' => [
+                    Permission::read(Role::any()),
+                    Permission::update(Role::user($userId)),
+                    Permission::delete(Role::user($userId)),
+                ],
+                'email' => $email,
+                // The directory is the authority on this address, and it just
+                // authenticated against it.
+                'emailVerification' => true,
+                'status' => true,
+                // No local password: this account can only ever be authenticated
+                // by the directory.
+                'password' => null,
+                'hash' => $proofForPassword->getHash()->getName(),
+                'hashOptions' => $proofForPassword->getHash()->getOptions(),
+                'passwordUpdate' => null,
+                'registration' => DateTime::now(),
+                'reset' => false,
+                'name' => $identity->getName() ?: null,
+                'mfa' => false,
+                'prefs' => new \stdClass(),
+                'sessions' => null,
+                'tokens' => null,
+                'memberships' => null,
+                'authenticators' => null,
+                'search' => \implode(' ', [$userId, $email, $identity->getName()]),
+                'accessedAt' => DateTime::now(),
+            ])));
+        }
+
+        if (false === $profile->getAttribute('status')) {
+            throw new Exception(Exception::USER_BLOCKED);
+        }
+
+        $user->setAttributes($profile->getArrayCopy());
+
+        $duration = $auths['duration'] ?? TOKEN_EXPIRATION_LOGIN_LONG;
+        $detector = new Detector($request->getUserAgent('UNKNOWN'));
+        $secret = $proofForToken->generate();
+        $session = new Document(array_merge(
+            [
+                '$id' => ID::unique(),
+                'userId' => $user->getId(),
+                'userInternalId' => $user->getSequence(),
+                'provider' => SESSION_PROVIDER_LDAP,
+                // The DN rather than the username: it is stable when display
+                // attributes change, and unambiguous across the directory.
+                'providerUid' => $identity->getDn(),
+                'secret' => $proofForToken->hash($secret),
+                'userAgent' => $request->getUserAgent('UNKNOWN'),
+                'ip' => $request->getIP(),
+                'factors' => ['password'],
+                'countryCode' => \strtolower($geoRecord->getCountryCode()),
+                'continentCode' => $geoRecord->getContinentCode() === '--' ? null : $geoRecord->getContinentCode(),
+                'latitude' => $geoRecord->getLatitude(),
+                'longitude' => $geoRecord->getLongitude(),
+                'timeZone' => $geoRecord->getTimeZone(),
+                'weatherCode' => $geoRecord->getWeatherCode(),
+                'postalCode' => $geoRecord->getPostalCode(),
+                'autonomousSystemNumber' => $geoRecord->getAutonomousSystemNumber(),
+                'autonomousSystemOrganization' => $geoRecord->getAutonomousSystemOrganization(),
+                'connectionType' => $geoRecord->getConnectionType(),
+                'connectionUsageType' => $geoRecord->getConnectionUsageType(),
+                'connectionOrganization' => $geoRecord->getConnectionOrganization(),
+                'isp' => $geoRecord->getIsp(),
+                'expire' => DateTime::addSeconds(new \DateTime(), $duration)
+            ],
+            $detector->getOS(),
+            $detector->getClient(),
+            $detector->getDevice()
+        ));
 
         $session = $dbForProject->createDocument('sessions', $session->setAttribute('$permissions', [
             Permission::read(Role::user($user->getId())),
